@@ -333,7 +333,6 @@
 
 ### The Production-Grade Deployment Script
 
-
 import os
 import hashlib
 import logging
@@ -374,7 +373,7 @@ client = AsyncAzureOpenAI(
 )
 
 # Time-To-Live cache setup to drop old conversation context entries automatically
-RESPONSE_CACHE = TTLCache(maxsize=200, ttl=300)
+RESPONSE_CACHE = TTLCache(maxsize=200, ttl=120)
 
 # Fallback setup used when ElevenLabs provides blank configurations
 FALLBACK_SYSTEM_PROMPT = {
@@ -403,7 +402,7 @@ class ChatRequest(BaseModel):
     messages: List[Message]
     tools: Optional[List[Any]] = None
     stream: bool = True
-    max_tokens: int = 150  # Tailored base length for real-time telecalling phrases
+    max_tokens: int = 250  # Upper buffer room for safe tool parameters + text completions
 
 # -----------------------------
 # 3. Startup Warmup Configuration
@@ -418,7 +417,7 @@ async def warmup():
                 {"role": "user", "content": "hi"}
             ],
             max_completion_tokens=5,
-            reasoning_effort="minimal"
+            reasoning_effort="low"
         )
         logger.warning("Azure connection pre-warmed successfully for gpt-5-nano.")
     except Exception as e:
@@ -435,14 +434,14 @@ async def chat_completions(req: ChatRequest, request: Request):
     async def event_generator():
         user_id = request.headers.get("x-user-id", "anonymous")
         
-        # Pull last true user query for targeted response verification cache checks
-        last_user_msg = next(
-            (m.content for m in reversed(req.messages) if m.role == "user" and m.content), 
-            ""
-        )
-        ckey = hashlib.md5(f"{user_id}:{last_user_msg}".encode()).hexdigest()
+        # ✅ FIX: Safe Context-Aware Multi-Turn Hashing 
+        # Captures the last two turns of history to prevent matching "yes/no" tokens from older steps
+        recent_turns = [f"{m.role}:{m.content}" for m in req.messages if m.content][-2:]
+        context_string = f"{user_id}:" + "|".join(recent_turns)
+        ckey = hashlib.md5(context_string.encode()).hexdigest()
         
-        if ckey in RESPONSE_CACHE:
+        # Never serve cached responses if the client is actively requesting tool checks
+        if ckey in RESPONSE_CACHE and not req.tools:
             cached_val = RESPONSE_CACHE[ckey]
             yield b"data: " + orjson.dumps({
                 "choices": [{"delta": {"content": cached_val}, "index": 0}]
@@ -464,7 +463,8 @@ async def chat_completions(req: ChatRequest, request: Request):
             ]
             
             # 3. Slicing with Tool Integrity Lookback
-            slice_index = -10
+            # ✅ INCREASED: Changed context length from -10 to -16 for expanded memory
+            slice_index = -16
             if abs(slice_index) < len(history_pool):
                 # If the first message inside our history window is a tool response, 
                 # we must look back one index further to capture its parent call metadata.
@@ -486,13 +486,18 @@ async def chat_completions(req: ChatRequest, request: Request):
                 dumped = m.model_dump(exclude_none=True)
                 final_messages.append(dumped)
 
+            # ✅ FIX: Dynamic Reasoning Allocation for Tools
+            # gpt-5-nano requires functional logic checking ("low") to correctly formulate tool blocks
+            effort_level = "low" if req.tools else "minimal"
+
             # High-Performance execution package tailored explicitly for GPT-5 Nano Architecture
             kwargs = {
                 "model": DEPLOYMENT,
                 "messages": final_messages,
                 "stream": True,
                 "max_completion_tokens": req.max_tokens,
-                "reasoning_effort": "minimal",  # Bypasses hidden thinking delays instantly
+                "reasoning_effort": effort_level,
+                "temperature": 0.0 if req.tools else 0.4, # Pure deterministic response for precise tools
                 "stream_options": {"include_usage": True},
             }
             
@@ -506,21 +511,21 @@ async def chat_completions(req: ChatRequest, request: Request):
             )
 
             async for chunk in response:
+                # ✅ FIX: Forward the raw complete payload dictionaries directly out across the wire
+                # This guarantees that complex structural delta elements like tool_calls are completely untampered
+                chunk_data = chunk.model_dump(exclude_none=True)
+                yield b"data: " + orjson.dumps(chunk_data) + b"\n\n"
+
                 if not chunk.choices:
                     continue
                 delta = chunk.choices[0].delta
-                if not delta.content:
-                    continue
+                
+                # Accrue standard conversational content tokens for caching
+                if delta.content:
+                    collected.append(delta.content)
 
-                token = delta.content
-                collected.append(token)
-
-                # Return payload structural parity match for native ElevenLabs streaming ingestion
-                yield b"data: " + orjson.dumps({
-                    "choices": [{"delta": {"content": token}, "index": 0}]
-                }) + b"\n\n"
-
-            if collected:
+            # Only cache text responses. Never cache active function calls.
+            if collected and not req.tools:
                 RESPONSE_CACHE[ckey] = "".join(collected)
 
             yield b"data: [DONE]\n\n"
@@ -560,4 +565,3 @@ if __name__ == "__main__":
         proxy_headers=True,
         forwarded_allow_ips="*"
     )
-
