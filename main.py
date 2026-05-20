@@ -328,18 +328,13 @@
 
 
 
-
-
-
-### The Production-Grade Deployment Script
-
 import os
-import hashlib
 import logging
 import asyncio
 import orjson
 import httpx
 import sys
+import xxhash
 from typing import List, Optional, Any
 from fastapi import FastAPI, Request, HTTPException
 from pydantic import BaseModel, ConfigDict
@@ -354,8 +349,9 @@ logging.basicConfig(level=logging.WARNING)
 logger = logging.getLogger("maya-ultra-low-latency")
 
 # Optimized pooling properties for low-latency streaming
-limits = httpx.Limits(max_keepalive_connections=50, max_connections=200)
-http_client = httpx.AsyncClient(limits=limits, timeout=30.0)
+limits = httpx.Limits(max_keepalive_connections=100, max_connections=500)
+timeout = httpx.Timeout(10.0, connect=5.0)
+http_client = httpx.AsyncClient(limits=limits, timeout=timeout)
 
 # Azure resource credentials for gpt-5-nano
 ENDPOINT = "https://impactguru-openai.cognitiveservices.azure.com/"
@@ -363,7 +359,9 @@ API_VERSION = "2024-12-01-preview"
 DEPLOYMENT = "gpt-5-nano"
 
 # Internal route key protection
-AUTH_KEY = os.getenv("CUSTOM_LLM_API_KEY", "tryingllmonx")
+AUTH_KEY = os.getenv("CUSTOM_LLM_API_KEY")
+if not AUTH_KEY:
+    raise RuntimeError("CUSTOM_LLM_API_KEY environment variable must be set")
 
 client = AsyncAzureOpenAI(
     api_key=os.getenv("AZURE_OPENAI_API_KEY"),
@@ -385,10 +383,14 @@ FALLBACK_SYSTEM_PROMPT = {
     )
 }
 
+# Pre‑compute SSE frame constants
+DATA_PREFIX = b"data: "
+DONE_MESSAGE = b"data: [DONE]\n\n"
+
 app = FastAPI()
 
 # -----------------------------
-# 2. Optimized Models
+# 2. Optimized Models (kept for reference, not used in endpoint anymore)
 # -----------------------------
 class Message(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
@@ -402,7 +404,7 @@ class ChatRequest(BaseModel):
     messages: List[Message]
     tools: Optional[List[Any]] = None
     stream: bool = True
-    max_tokens: int = 250  # Upper buffer room for safe tool parameters + text completions
+    max_tokens: int = 250
 
 # -----------------------------
 # 3. Startup Warmup Configuration
@@ -424,85 +426,91 @@ async def warmup():
         logger.warning(f"Warmup failed (non-fatal): {e}")
 
 # -----------------------------
-# 4. Core Router Implementation
+# 4. Core Router Implementation (ULTRA‑FAST)
 # -----------------------------
 @app.post("/custom-llm/chat/completions")
-async def chat_completions(req: ChatRequest, request: Request):
+async def chat_completions(request: Request):
+    # Auth
     if request.headers.get("x-api-key") != AUTH_KEY:
         raise HTTPException(status_code=401)
 
-    async def event_generator():
-        user_id = request.headers.get("x-user-id", "anonymous")
-        
-        # ✅ FIX: Safe Context-Aware Multi-Turn Hashing 
-        # Captures the last two turns of history to prevent matching "yes/no" tokens from older steps
-        recent_turns = [f"{m.role}:{m.content}" for m in req.messages if m.content][-2:]
-        context_string = f"{user_id}:" + "|".join(recent_turns)
-        ckey = hashlib.md5(context_string.encode()).hexdigest()
-        
-        # Never serve cached responses if the client is actively requesting tool checks
-        if ckey in RESPONSE_CACHE and not req.tools:
-            cached_val = RESPONSE_CACHE[ckey]
-            yield b"data: " + orjson.dumps({
+    # Parse body once with orjson
+    body = await request.body()
+    req = orjson.loads(body)
+
+    user_id = request.headers.get("x-user-id", "anonymous")
+    messages = req["messages"]          # list of dicts
+    tools = req.get("tools", None)
+    max_tokens = req.get("max_tokens", 250)
+
+    # ---- Cache key using last two turns ----
+    recent_turns = [
+        f"{m['role']}:{m['content']}" for m in messages if m.get("content")
+    ][-2:]
+    ckey = xxhash.xxh64(f"{user_id}|{'|'.join(recent_turns)}").hexdigest()
+
+    # Serve cached response if available and no tools
+    if ckey in RESPONSE_CACHE and not tools:
+        cached_val = RESPONSE_CACHE[ckey]
+        async def cached_stream():
+            yield DATA_PREFIX + orjson.dumps({
                 "choices": [{"delta": {"content": cached_val}, "index": 0}]
             }) + b"\n\n"
-            yield b"data: [DONE]\n\n"
-            return
+            yield DONE_MESSAGE
+        return StreamingResponse(
+            cached_stream(),
+            media_type="text/event-stream",
+            headers={
+                "X-Accel-Buffering": "no",
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive"
+            }
+        )
 
+    # ---- Build final_messages efficiently ----
+    system_msgs = [m for m in messages if m["role"] == "system" and m.get("content")]
+    final_messages = system_msgs.copy()   # shallow copy of system messages
+    if not system_msgs:
+        final_messages.append(FALLBACK_SYSTEM_PROMPT.copy())  # copy to avoid mutation
+
+    # Non‑system messages in order
+    non_system = [m for m in messages if m["role"] != "system"]
+
+    # Truncate history, preserving tool chains
+    max_turns = 16
+    if len(non_system) > max_turns:
+        cut = len(non_system) - max_turns
+        # If the first message in the window is a tool response, pull in its parent
+        if non_system[cut]["role"] == "tool":
+            cut -= 1
+        kept = non_system[cut:]
+    else:
+        kept = non_system
+
+    # Clean messages (remove None values) and extend
+    final_messages.extend(
+        {k: v for k, v in msg.items() if v is not None} for msg in kept
+    )
+
+    # ---- Dynamic parameters ----
+    reasoning = "low" if tools else "minimal"
+    temperature = 0.0 if tools else 0.4
+
+    # ---- Streaming ----
+    async def event_generator():
         collected = []
         try:
-            # 1. Separate System Messages
-            system_messages = [
-                {"role": m.role, "content": m.content} 
-                for m in req.messages if m.role == "system" and m.content
-            ]
-            
-            # 2. Extract History (Excluding System)
-            history_pool = [
-                m for m in req.messages if m.role != "system"
-            ]
-            
-            # 3. Slicing with Tool Integrity Lookback
-            # ✅ INCREASED: Changed context length from -10 to -16 for expanded memory
-            slice_index = -16
-            if abs(slice_index) < len(history_pool):
-                # If the first message inside our history window is a tool response, 
-                # we must look back one index further to capture its parent call metadata.
-                if history_pool[slice_index].role == "tool":
-                    slice_index -= 1 
-            
-            recent_history = history_pool[slice_index:]
-            
-            # 4. Reconstruct optimized payload with ElevenLabs context respect logic
-            final_messages = []
-            if not system_messages:
-                final_messages.append(FALLBACK_SYSTEM_PROMPT)
-            else:
-                final_messages.extend([
-                    {"role": m["role"], "content": m["content"]} for m in system_messages
-                ])
-            
-            for m in recent_history:
-                dumped = m.model_dump(exclude_none=True)
-                final_messages.append(dumped)
-
-            # ✅ FIX: Dynamic Reasoning Allocation for Tools
-            # gpt-5-nano requires functional logic checking ("low") to correctly formulate tool blocks
-            effort_level = "low" if req.tools else "minimal"
-
-            # High-Performance execution package tailored explicitly for GPT-5 Nano Architecture
             kwargs = {
                 "model": DEPLOYMENT,
                 "messages": final_messages,
                 "stream": True,
-                "max_completion_tokens": req.max_tokens,
-                "reasoning_effort": effort_level,
-                "temperature": 0.0 if req.tools else 0.4, # Pure deterministic response for precise tools
+                "max_completion_tokens": max_tokens,
+                "reasoning_effort": reasoning,
+                
                 "stream_options": {"include_usage": True},
             }
-            
-            if req.tools:
-                kwargs["tools"] = req.tools
+            if tools:
+                kwargs["tools"] = tools
                 kwargs["tool_choice"] = "auto"
 
             response = await asyncio.wait_for(
@@ -510,32 +518,30 @@ async def chat_completions(req: ChatRequest, request: Request):
                 timeout=15.0
             )
 
+            # Use to_dict() if available (fastest), fallback to model_dump
             async for chunk in response:
-                # ✅ FIX: Forward the raw complete payload dictionaries directly out across the wire
-                # This guarantees that complex structural delta elements like tool_calls are completely untampered
-                chunk_data = chunk.model_dump(exclude_none=True)
-                yield b"data: " + orjson.dumps(chunk_data) + b"\n\n"
+                # Fast dict extraction
+                chunk_dict = chunk.to_dict() if hasattr(chunk, "to_dict") else chunk.model_dump(exclude_none=True)
+                yield DATA_PREFIX + orjson.dumps(chunk_dict) + b"\n\n"
 
                 if not chunk.choices:
                     continue
                 delta = chunk.choices[0].delta
-                
-                # Accrue standard conversational content tokens for caching
                 if delta.content:
                     collected.append(delta.content)
 
-            # Only cache text responses. Never cache active function calls.
-            if collected and not req.tools:
+            # Cache only text responses, never tool calls
+            if collected and not tools:
                 RESPONSE_CACHE[ckey] = "".join(collected)
 
-            yield b"data: [DONE]\n\n"
+            yield DONE_MESSAGE
 
         except Exception as e:
             logger.error(f"Streaming Error: {e}")
-            yield b"data: [DONE]\n\n"
+            yield DONE_MESSAGE
 
     return StreamingResponse(
-        event_generator(), 
+        event_generator(),
         media_type="text/event-stream",
         headers={
             "X-Accel-Buffering": "no",
@@ -544,6 +550,9 @@ async def chat_completions(req: ChatRequest, request: Request):
         }
     )
 
+# -----------------------------
+# 5. Health & Shutdown
+# -----------------------------
 @app.get("/health")
 async def health():
     return {"status": "ok", "cache_size": len(RESPONSE_CACHE)}
@@ -552,14 +561,17 @@ async def health():
 async def shutdown_event():
     await http_client.aclose()
 
+# -----------------------------
+# 6. Entrypoint
+# -----------------------------
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 8000))
     loop_type = "uvloop" if sys.platform != "win32" else "asyncio"
     uvicorn.run(
-        "main:app", 
-        host="0.0.0.0", 
-        port=port, 
+        "main:app",
+        host="0.0.0.0",
+        port=port,
         loop=loop_type,
         log_level="warning",
         proxy_headers=True,
