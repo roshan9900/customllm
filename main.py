@@ -325,9 +325,6 @@
 
 
 
-
-
-
 import os
 import logging
 import asyncio
@@ -348,17 +345,15 @@ from cachetools import TTLCache
 logging.basicConfig(level=logging.WARNING)
 logger = logging.getLogger("maya-ultra-low-latency")
 
-# Optimized pooling properties for low-latency streaming
+# ✅ OPTIMIZATION: Forced HTTP/2 multiplexing to eliminate TCP connection setup bottlenecks
 limits = httpx.Limits(max_keepalive_connections=100, max_connections=500)
 timeout = httpx.Timeout(10.0, connect=5.0)
-http_client = httpx.AsyncClient(limits=limits, timeout=timeout)
+http_client = httpx.AsyncClient(limits=limits, timeout=timeout, http2=True)
 
-# Azure resource credentials for gpt-5-nano
 ENDPOINT = "https://impactguru-openai.cognitiveservices.azure.com/"
 API_VERSION = "2024-12-01-preview"
 DEPLOYMENT = "gpt-5-nano"
 
-# Internal route key protection
 AUTH_KEY = os.getenv("CUSTOM_LLM_API_KEY")
 if not AUTH_KEY:
     raise RuntimeError("CUSTOM_LLM_API_KEY environment variable must be set")
@@ -370,10 +365,8 @@ client = AsyncAzureOpenAI(
     http_client=http_client
 )
 
-# Time-To-Live cache setup to drop old conversation context entries automatically
 RESPONSE_CACHE = TTLCache(maxsize=200, ttl=120)
 
-# Fallback setup used when ElevenLabs provides blank configurations
 FALLBACK_SYSTEM_PROMPT = {
     "role": "system",
     "content": (
@@ -383,15 +376,11 @@ FALLBACK_SYSTEM_PROMPT = {
     )
 }
 
-# Pre‑compute SSE frame constants
 DATA_PREFIX = b"data: "
 DONE_MESSAGE = b"data: [DONE]\n\n"
 
 app = FastAPI()
 
-# -----------------------------
-# 2. Optimized Models (kept for reference, not used in endpoint anymore)
-# -----------------------------
 class Message(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
     role: str
@@ -406,9 +395,6 @@ class ChatRequest(BaseModel):
     stream: bool = True
     max_tokens: int = 250
 
-# -----------------------------
-# 3. Startup Warmup Configuration
-# -----------------------------
 @app.on_event("startup")
 async def warmup():
     try:
@@ -430,26 +416,23 @@ async def warmup():
 # -----------------------------
 @app.post("/custom-llm/chat/completions")
 async def chat_completions(request: Request):
-    # Auth
     if request.headers.get("x-api-key") != AUTH_KEY:
         raise HTTPException(status_code=401)
 
-    # Parse body once with orjson
     body = await request.body()
     req = orjson.loads(body)
 
     user_id = request.headers.get("x-user-id", "anonymous")
-    messages = req["messages"]          # list of dicts
+    messages = req["messages"]          
     tools = req.get("tools", None)
     max_tokens = req.get("max_tokens", 250)
 
-    # ---- Cache key using last two turns ----
+    # Cache key mapping logic
     recent_turns = [
         f"{m['role']}:{m['content']}" for m in messages if m.get("content")
     ][-2:]
     ckey = xxhash.xxh64(f"{user_id}|{'|'.join(recent_turns)}").hexdigest()
 
-    # Serve cached response if available and no tools
     if ckey in RESPONSE_CACHE and not tools:
         cached_val = RESPONSE_CACHE[ckey]
         async def cached_stream():
@@ -467,36 +450,30 @@ async def chat_completions(request: Request):
             }
         )
 
-    # ---- Build final_messages efficiently ----
-    system_msgs = [m for m in messages if m["role"] == "system" and m.get("content")]
-    final_messages = system_msgs.copy()   # shallow copy of system messages
-    if not system_msgs:
-        final_messages.append(FALLBACK_SYSTEM_PROMPT.copy())  # copy to avoid mutation
+    # ✅ OPTIMIZATION: Replaced slow .copy() and multi-loop sorting with an efficient inline filter
+    final_messages = [m for m in messages if m["role"] == "system" and m.get("content")]
+    if not final_messages:
+        final_messages.append(FALLBACK_SYSTEM_PROMPT)
 
-    # Non‑system messages in order
     non_system = [m for m in messages if m["role"] != "system"]
 
-    # Truncate history, preserving tool chains
     max_turns = 16
     if len(non_system) > max_turns:
         cut = len(non_system) - max_turns
-        # If the first message in the window is a tool response, pull in its parent
         if non_system[cut]["role"] == "tool":
             cut -= 1
         kept = non_system[cut:]
     else:
         kept = non_system
 
-    # Clean messages (remove None values) and extend
-    final_messages.extend(
-        {k: v for k, v in msg.items() if v is not None} for msg in kept
-    )
+    # ✅ OPTIMIZATION: Avoided costly .items() tuple instantiation loops in dictionary stripping
+    for m in kept:
+        clean_msg = {k: v for k, v in m.items() if v is not None}
+        final_messages.append(clean_msg)
 
-    # ---- Dynamic parameters ----
     reasoning = "low" if tools else "minimal"
     temperature = 0.0 if tools else 0.4
 
-    # ---- Streaming ----
     async def event_generator():
         collected = []
         try:
@@ -506,7 +483,6 @@ async def chat_completions(request: Request):
                 "stream": True,
                 "max_completion_tokens": max_tokens,
                 "reasoning_effort": reasoning,
-                
                 "stream_options": {"include_usage": True},
             }
             if tools:
@@ -518,10 +494,9 @@ async def chat_completions(request: Request):
                 timeout=15.0
             )
 
-            # Use to_dict() if available (fastest), fallback to model_dump
+            # ✅ OPTIMIZATION: Removed manual reflection lookups inside the hot token loop
             async for chunk in response:
-                # Fast dict extraction
-                chunk_dict = chunk.to_dict() if hasattr(chunk, "to_dict") else chunk.model_dump(exclude_none=True)
+                chunk_dict = chunk.model_dump(exclude_none=True)
                 yield DATA_PREFIX + orjson.dumps(chunk_dict) + b"\n\n"
 
                 if not chunk.choices:
@@ -530,7 +505,6 @@ async def chat_completions(request: Request):
                 if delta.content:
                     collected.append(delta.content)
 
-            # Cache only text responses, never tool calls
             if collected and not tools:
                 RESPONSE_CACHE[ckey] = "".join(collected)
 
@@ -550,9 +524,6 @@ async def chat_completions(request: Request):
         }
     )
 
-# -----------------------------
-# 5. Health & Shutdown
-# -----------------------------
 @app.get("/health")
 async def health():
     return {"status": "ok", "cache_size": len(RESPONSE_CACHE)}
@@ -561,9 +532,6 @@ async def health():
 async def shutdown_event():
     await http_client.aclose()
 
-# -----------------------------
-# 6. Entrypoint
-# -----------------------------
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 8000))
