@@ -6,4 +6,4 @@ openai>=1.50.0
 uvloop==0.21.0; sys_platform != 'win32'  # <--- Essential for the Docker build
 httptools==0.6.4
 cachetools==5.5.0
-
+xxhash
