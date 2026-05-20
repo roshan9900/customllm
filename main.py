@@ -403,7 +403,7 @@ class ChatRequest(BaseModel):
     messages: List[Message]
     tools: Optional[List[Any]] = None
     stream: bool = True
-    max_tokens: int = 60  # Tailored base length for real-time telecalling phrases
+    max_tokens: int = 150  # Tailored base length for real-time telecalling phrases
 
 # -----------------------------
 # 3. Startup Warmup Configuration
